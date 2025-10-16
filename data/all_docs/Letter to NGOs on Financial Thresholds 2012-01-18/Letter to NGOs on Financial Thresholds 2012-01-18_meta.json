@@ -1,0 +1,201 @@
+{
+  "table_of_contents": [
+    {
+      "title": "Report No. 56 of the Director of Audit (Chapter 3)",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          162.6817610062893,
+          273.933837890625
+        ],
+        [
+          444.08984374999994,
+          273.933837890625
+        ],
+        [
+          444.08984374999994,
+          287.105712890625
+        ],
+        [
+          162.6817610062893,
+          287.105712890625
+        ]
+      ]
+    },
+    {
+      "title": "Financial Thresholds for Funding Capital Expenditure by\nLump Sum Grant or Lump Sum Grant Reserve",
+      "heading_level": null,
+      "page_id": 0,
+      "polygon": [
+        [
+          146.188679245283,
+          304.393798828125
+        ],
+        [
+          460.96874999999994,
+          304.393798828125
+        ],
+        [
+          460.96874999999994,
+          331.5
+        ],
+        [
+          146.188679245283,
+          331.5
+        ]
+      ]
+    },
+    {
+      "title": "c.c. Chief Executive Officers/Directors of NGO",
+      "heading_level": null,
+      "page_id": 2,
+      "polygon": [
+        [
+          80.96603773584906,
+          712.5
+        ],
+        [
+          331.466796875,
+          712.5
+        ],
+        [
+          331.466796875,
+          725.2763671875
+        ],
+        [
+          80.96603773584906,
+          725.2763671875
+        ]
+      ]
+    }
+  ],
+  "page_stats": [
+    {
+      "page_id": 0,
+      "text_extraction_method": "surya",
+      "block_counts": [
+        [
+          "Line",
+          40
+        ],
+        [
+          "Span",
+          40
+        ],
+        [
+          "Text",
+          8
+        ],
+        [
+          "SectionHeader",
+          2
+        ],
+        [
+          "Picture",
+          1
+        ],
+        [
+          "Footnote",
+          1
+        ]
+      ],
+      "block_metadata": {
+        "llm_request_count": 0,
+        "llm_error_count": 0,
+        "llm_tokens_used": 0
+      }
+    },
+    {
+      "page_id": 1,
+      "text_extraction_method": "surya",
+      "block_counts": [
+        [
+          "Line",
+          35
+        ],
+        [
+          "Span",
+          35
+        ],
+        [
+          "ListItem",
+          13
+        ],
+        [
+          "Text",
+          2
+        ],
+        [
+          "PageHeader",
+          1
+        ],
+        [
+          "PageFooter",
+          1
+        ],
+        [
+          "ListGroup",
+          1
+        ]
+      ],
+      "block_metadata": {
+        "llm_request_count": 0,
+        "llm_error_count": 0,
+        "llm_tokens_used": 0
+      }
+    },
+    {
+      "page_id": 2,
+      "text_extraction_method": "surya",
+      "block_counts": [
+        [
+          "Line",
+          35
+        ],
+        [
+          "Span",
+          35
+        ],
+        [
+          "Text",
+          4
+        ],
+        [
+          "ListItem",
+          3
+        ],
+        [
+          "PageHeader",
+          1
+        ],
+        [
+          "Handwriting",
+          1
+        ],
+        [
+          "Caption",
+          1
+        ],
+        [
+          "SectionHeader",
+          1
+        ],
+        [
+          "PageFooter",
+          1
+        ],
+        [
+          "ListGroup",
+          1
+        ]
+      ],
+      "block_metadata": {
+        "llm_request_count": 0,
+        "llm_error_count": 0,
+        "llm_tokens_used": 0
+      }
+    }
+  ],
+  "debug_data_path": "debug_data/Letter to NGOs on Financial Thresholds 2012-01-18"
+}
