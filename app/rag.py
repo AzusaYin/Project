@@ -94,7 +94,6 @@ class Index:
         return list(zip(I[0].tolist(), D[0].tolist()))
 
 # --- Chunking (safe & fast) ---
-
 def simple_char_chunk(text: str, chunk_size: int, overlap: int) -> List[str]:
     step = max(1, chunk_size - overlap)
     n = len(text)
@@ -103,7 +102,6 @@ def simple_char_chunk(text: str, chunk_size: int, overlap: int) -> List[str]:
     return [text[i:i+chunk_size] for i in range(0, n, step)]
 
 # --- Ingestion ---
-
 def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
     docs = read_markdown_files(docs_dir)
     print(f"[ingest] loaded {len(docs)} doc(s)")

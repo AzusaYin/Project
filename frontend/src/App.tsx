@@ -1,5 +1,8 @@
 // === App.tsx (with left sidebar: chat thread selector + rename + Enter-to-send) ===
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState, Suspense} from "react";
+import AdminDocs from "./AdminDocs";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 /* =========================
    Single-file React frontend for ElderlyCare HK
@@ -212,6 +215,7 @@ function injectFallbackCSS() {
   .ec-contrast .ec-input,.ec-contrast .ec-select,.ec-contrast .ec-text { background:#000; border-color:#4b5563; color:#fff; }
   .ec-range { vertical-align: middle; }
 
+
   /* ====== two-column layout (sidebar + main) ====== */
   .ec-layout { display:flex; gap:16px; min-height:0; flex:1 1 auto; }
   .ec-sidebar {
@@ -287,6 +291,17 @@ function injectFallbackCSS() {
   .ec-bubble{max-width:85%;border-radius:16px;padding:12px 16px;box-shadow:0 1px 2px rgba(0,0,0,.06);font-size:1em;}
   .ec-bubble.user{margin-left:auto;background:#2563eb;color:#fff}
   .ec-bubble.assistant{margin-right:auto;background:rgba(255,255,255,.9);color:#111827;border:1px solid #e5e7eb}
+
+  .ec-md { line-height: 1.6; white-space: normal; word-break: break-word; }
+  .ec-md p { margin: 0.4em 0; }
+  .ec-md h1, .ec-md h2, .ec-md h3, .ec-md h4, .ec-md h5, .ec-md h6 {
+    margin: 0.6em 0 0.3em; font-weight: 700; line-height: 1.25;
+  }
+  .ec-md ul, .ec-md ol { padding-left: 1.25em; margin: 0.4em 0; }
+  .ec-md code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: .95em; background: rgba(0,0,0,.05); padding: .1em .35em; border-radius: .3em; }
+  .ec-md pre { background: rgba(0,0,0,.05); padding: .8em; border-radius: .6em; overflow: auto; }
+  .ec-contrast .ec-md code, .ec-contrast .ec-md pre { background: rgba(255,255,255,.08); }
+  .ec-md a { text-decoration: underline; }
 
   /* ===== Normal Mode: Sources Section ===== */
   .ec-sources { 
@@ -575,6 +590,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const [showAdmin, setShowAdmin] = useState(false);
 
   // ===== threads state =====
   const [threads, setThreads] = useState<ThreadMeta[]>(() => {
@@ -854,174 +870,203 @@ export default function App() {
             </label>
             <label className="flex items-center gap-2">
               <input type="checkbox" checked={highContrast} onChange={e => setHighContrast(e.target.checked)} />
-              <span className="text-sm">{tr(language, "highContrast")}</span>
+              <span className="text-sm">{tr(language, "highContrast")}</span>             
             </label>
+            
+            <button
+              className="ec-mini"
+              onClick={() => setShowAdmin(v => !v)}
+              aria-label="Admin panel"
+            >
+              {showAdmin ? (language === "zh-Hant" ? "返回對話" : "Back to Chat") : "Admin"}
+            </button>
           </div>
         </header>
 
         {/* Two-column layout */}
-        <div className="ec-layout">
-          {/* Sidebar: thread list */}
-          <aside className="ec-sidebar" aria-label="Conversation list">
-            <div className="ec-side-head">
-              <div className="ec-side-title">{tr(language, "chats")}</div>
-              <div className="ec-side-actions">
-                <button className="ec-mini" 
-                  onClick={createThread} 
-                  aria-label="New chat">
-                  ＋ {tr(language, "new")}
-                </button>
-                <button
-                  className="ec-mini"
-                  onClick={() => currentThreadId && deleteThread(currentThreadId)}
-                  disabled={!currentThreadId}
-                  aria-label="Delete current chat"
-                >
-                  🗑 {tr(language, "delete")}
-                </button>
-                <button
-                  className="ec-mini"
-                  onClick={() => {
-                    const t = threads.find(x => x.id === currentThreadId);
-                    if (t) beginRename(t);
-                  }}
-                  disabled={!currentThreadId}
-                  aria-label="Rename current chat"
-                >
-                  ✏️ {tr(language, "rename")}
-                </button>
-              </div>
+          {showAdmin ? (
+            <div className="ec-layout">
+              <main className="ec-main">
+                <AdminDocs />
+              </main>
             </div>
+          ) : (
+          <div className="ec-layout">
+            {/* Sidebar: thread list */}
+            <aside className="ec-sidebar" aria-label="Conversation list">
+              <div className="ec-side-head">
+                <div className="ec-side-title">{tr(language, "chats")}</div>
+                <div className="ec-side-actions">
+                  <button className="ec-mini" 
+                    onClick={createThread} 
+                    aria-label="New chat">
+                    ＋ {tr(language, "new")}
+                  </button>
+                  <button
+                    className="ec-mini"
+                    onClick={() => currentThreadId && deleteThread(currentThreadId)}
+                    disabled={!currentThreadId}
+                    aria-label="Delete current chat"
+                  >
+                    🗑 {tr(language, "delete")}
+                  </button>
+                  <button
+                    className="ec-mini"
+                    onClick={() => {
+                      const t = threads.find(x => x.id === currentThreadId);
+                      if (t) beginRename(t);
+                    }}
+                    disabled={!currentThreadId}
+                    aria-label="Rename current chat"
+                  >
+                    ✏️ {tr(language, "rename")}
+                  </button>
+                </div>
+              </div>
 
-            <div className="ec-side-list" role="list">
-              {threads.map(t => (
-                <div key={t.id}>
-                  {renamingId === t.id ? (
-                    <form
-                      className="ec-thread-btn active"
-                      onSubmit={(e) => { e.preventDefault(); applyRename(t.id); }}
-                      style={{ display: "flex", flexDirection: "column", gap: 6 }}
-                    >
-                      <input
-                        autoFocus
-                        value={renameDraft}
-                        onChange={(e) => setRenameDraft(e.target.value)}
-                        onBlur={() => applyRename(t.id)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Escape") { setRenamingId(null); setRenameDraft(""); }
-                          if (e.key === "Enter") { e.preventDefault(); applyRename(t.id); }
-                        }}
-                        className="ec-input"
-                        aria-label="Edit chat title"
-                        placeholder={tr(language, "backendPlaceholder")}
-                        style={{ width: "100%", whiteSpace: "normal", wordBreak: "break-word" }}
-                      />
-                      <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-                        <button type="button" className="ec-mini" onClick={() => { setRenamingId(null); setRenameDraft(""); }}>
-                          {language === "zh-Hant" ? "取消" : "Cancel"}
-                        </button>
-                        <button type="submit" className="ec-mini">
-                          {language === "zh-Hant" ? "儲存" : "Save"}
-                        </button>
-                      </div>
-                    </form>
-                  ) : (
-                    <button
-                      role="listitem"
-                      className={cx("ec-thread-btn", t.id === currentThreadId ? "active" : "")}
-                      onClick={() => selectThread(t.id)}
-                      onDoubleClick={() => beginRename(t)}
-                      title={new Date(t.updatedAt).toLocaleString() + "\n" + t.title}
-                      style={{ whiteSpace: "normal", wordBreak: "break-word", overflow: "visible" }}
-                    >
-                      <div style={{fontWeight:600, marginBottom:2, whiteSpace:"normal", wordBreak:"break-word"}}>{t.title}</div>
-                      <div style={{opacity:.65, fontSize:'.85em'}}>
-                        {new Date(t.updatedAt).toLocaleString()}
-                      </div>
+              <div className="ec-side-list" role="list">
+                {threads.map(t => (
+                  <div key={t.id}>
+                    {renamingId === t.id ? (
+                      <form
+                        className="ec-thread-btn active"
+                        onSubmit={(e) => { e.preventDefault(); applyRename(t.id); }}
+                        style={{ display: "flex", flexDirection: "column", gap: 6 }}
+                      >
+                        <input
+                          autoFocus
+                          value={renameDraft}
+                          onChange={(e) => setRenameDraft(e.target.value)}
+                          onBlur={() => applyRename(t.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Escape") { setRenamingId(null); setRenameDraft(""); }
+                            if (e.key === "Enter") { e.preventDefault(); applyRename(t.id); }
+                          }}
+                          className="ec-input"
+                          aria-label="Edit chat title"
+                          placeholder={tr(language, "backendPlaceholder")}
+                          style={{ width: "100%", whiteSpace: "normal", wordBreak: "break-word" }}
+                        />
+                        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                          <button type="button" className="ec-mini" onClick={() => { setRenamingId(null); setRenameDraft(""); }}>
+                            {language === "zh-Hant" ? "取消" : "Cancel"}
+                          </button>
+                          <button type="submit" className="ec-mini">
+                            {language === "zh-Hant" ? "儲存" : "Save"}
+                          </button>
+                        </div>
+                      </form>
+                    ) : (
+                      <button
+                        role="listitem"
+                        className={cx("ec-thread-btn", t.id === currentThreadId ? "active" : "")}
+                        onClick={() => selectThread(t.id)}
+                        onDoubleClick={() => beginRename(t)}
+                        title={new Date(t.updatedAt).toLocaleString() + "\n" + t.title}
+                        style={{ whiteSpace: "normal", wordBreak: "break-word", overflow: "visible" }}
+                      >
+                        <div style={{fontWeight:600, marginBottom:2, whiteSpace:"normal", wordBreak:"break-word"}}>{t.title}</div>
+                        <div style={{opacity:.65, fontSize:'.85em'}}>
+                          {new Date(t.updatedAt).toLocaleString()}
+                        </div>
+                      </button>
+                    )}
+                  </div>
+                ))}
+                {threads.length === 0 && (
+                  <div style={{opacity:.6, fontSize:'.95em'}}>
+                    {language === "zh-Hant" ? "目前沒有對話。" : "No chats yet."}
+                  </div>
+                )}
+              </div>
+            </aside>
+            {/* Main content (chat + composer) */}
+            <main className="ec-main">
+              {/* Chat window */}
+              <section
+                ref={listRef}
+                className={cx("ec-chat", "rounded-2xl p-4 border", highContrast ? "bg-black border-gray-700" : "bg-white border-gray-200")}
+                aria-live="polite"
+              >
+                {history.length === 0 && (
+                  <div className={cx("ec-empty", "text-center pt-16", highContrast ? "text-gray-400" : "text-slate-500")}>
+                    {tr(language, "emptyHint")}
+                  </div>
+                )}
+
+                {history.map((m, idx) => {
+                  const prevUser = [...history.slice(0, idx)].reverse().find(x => x.role === "user");
+                  return (
+                    <div key={m.id}>
+                      <Bubble role={m.role}>
+                        {m.role === "assistant" ? (
+                          <div className="ec-md">
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              // 不渲染原始 HTML，避免 XSS；我们只支持 Markdown 语法
+                              skipHtml
+                              // 允许换行行为更自然（可选）
+                              // linkTarget="_blank" 也可以在这里加
+                            >
+                              {m.text || ""}
+                            </ReactMarkdown>
+                          </div>
+                        ) : (
+                          <div className="whitespace-pre-wrap break-words">{m.text}</div>
+                        )}
+
+                        {m.role === "assistant" && m.citations && <Citations items={m.citations} lang={language} />}
+                      </Bubble>
+                      {m.role === "assistant" && (
+                        <Feedback
+                          messageId={m.id}
+                          lang={language}
+                          backendBase={makeChatEndpoint(backendUrl).replace(/\/chat$/i, "")}
+                          threadId={currentThreadId!}
+                          userQuery={prevUser?.text || ""}
+                          answer={m.text}
+                          citations={m.citations || []}
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+
+                {loading && <div className="mt-2 text-sm opacity-70">Generating…</div>}
+                {error && <div className="mt-2 text-sm text-red-600">Error: {error}</div>}
+              </section>
+
+              {/* Composer */}
+              <form className={cx("ec-row", "mt-4 flex flex-wrap items-end gap-3")} onSubmit={(e) => { e.preventDefault(); sendMessage(); }}>
+                <label className="flex-1 min-w-0 ec-grow">
+                  <span className="sr-only">Your question</span>
+                  <textarea
+                    value={input}
+                    onChange={e => setInput(e.target.value)}
+                    placeholder={tr(language, "askPlaceholder")}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        sendMessage();
+                      }
+                    }}
+                    className={cx("ec-text","w-full min-h-[64px] max-h-[160px] p-3 rounded-2xl border resize-y", highContrast ? "bg-black border-gray-700 text-white placeholder-gray-400" : "bg-white border-gray-300")}
+                  />
+                </label>
+                <div className="flex gap-2 ec-actions flex-shrink-0 w-full sm:w-auto justify-end">
+                  <button type="submit" disabled={loading || !input.trim()} className={cx("ec-btn ec-btn-primary","inline-flex items-center gap-2 px-4 py-3 rounded-2xl font-medium", loading || !input.trim() ? "opacity-60 cursor-not-allowed" : "")} aria-label="Send message">
+                    <IconSend /> {tr(language, "send")}
+                  </button>
+                  {loading && (
+                    <button type="button" onClick={stopStreaming} className={cx("ec-btn ec-btn-secondary", "inline-flex items-center gap-2 px-4 py-3 rounded-2xl font-medium")} aria-label="Stop streaming">
+                      <IconStop /> {tr(language, "stop")}
                     </button>
                   )}
                 </div>
-              ))}
-              {threads.length === 0 && (
-                <div style={{opacity:.6, fontSize:'.95em'}}>
-                  {language === "zh-Hant" ? "目前沒有對話。" : "No chats yet."}
-                </div>
-              )}
-            </div>
-          </aside>
-
-          {/* Main content (chat + composer) */}
-          <main className="ec-main">
-            {/* Chat window */}
-            <section
-              ref={listRef}
-              className={cx("ec-chat", "rounded-2xl p-4 border", highContrast ? "bg-black border-gray-700" : "bg-white border-gray-200")}
-              aria-live="polite"
-            >
-              {history.length === 0 && (
-                <div className={cx("ec-empty", "text-center pt-16", highContrast ? "text-gray-400" : "text-slate-500")}>
-                  {tr(language, "emptyHint")}
-                </div>
-              )}
-
-              {history.map((m, idx) => {
-                const prevUser = [...history.slice(0, idx)].reverse().find(x => x.role === "user");
-                return (
-                  <div key={m.id}>
-                    <Bubble role={m.role}>
-                      <div className="whitespace-pre-wrap break-words">{m.text}</div>
-                      {m.role === "assistant" && m.citations && <Citations items={m.citations} lang={language} />}
-                    </Bubble>
-                    {m.role === "assistant" && (
-                      <Feedback
-                        messageId={m.id}
-                        lang={language}
-                        backendBase={makeChatEndpoint(backendUrl).replace(/\/chat$/i, "")}
-                        threadId={currentThreadId!}
-                        userQuery={prevUser?.text || ""}
-                        answer={m.text}
-                        citations={m.citations || []}
-                      />
-                    )}
-                  </div>
-                );
-              })}
-
-              {loading && <div className="mt-2 text-sm opacity-70">Generating…</div>}
-              {error && <div className="mt-2 text-sm text-red-600">Error: {error}</div>}
-            </section>
-
-            {/* Composer */}
-            <form className={cx("ec-row", "mt-4 flex flex-wrap items-end gap-3")} onSubmit={(e) => { e.preventDefault(); sendMessage(); }}>
-              <label className="flex-1 min-w-0 ec-grow">
-                <span className="sr-only">Your question</span>
-                <textarea
-                  value={input}
-                  onChange={e => setInput(e.target.value)}
-                  placeholder={tr(language, "askPlaceholder")}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      sendMessage();
-                    }
-                  }}
-                  className={cx("ec-text","w-full min-h-[64px] max-h-[160px] p-3 rounded-2xl border resize-y", highContrast ? "bg-black border-gray-700 text-white placeholder-gray-400" : "bg-white border-gray-300")}
-                />
-              </label>
-              <div className="flex gap-2 ec-actions flex-shrink-0 w-full sm:w-auto justify-end">
-                <button type="submit" disabled={loading || !input.trim()} className={cx("ec-btn ec-btn-primary","inline-flex items-center gap-2 px-4 py-3 rounded-2xl font-medium", loading || !input.trim() ? "opacity-60 cursor-not-allowed" : "")} aria-label="Send message">
-                  <IconSend /> {tr(language, "send")}
-                </button>
-                {loading && (
-                  <button type="button" onClick={stopStreaming} className={cx("ec-btn ec-btn-secondary", "inline-flex items-center gap-2 px-4 py-3 rounded-2xl font-medium")} aria-label="Stop streaming">
-                    <IconStop /> {tr(language, "stop")}
-                  </button>
-                )}
-              </div>
-            </form>
-          </main>
-        </div>
-
+              </form>
+            </main>
+          </div>
+      )}
         {/* Footer */}
         <footer className={cx("ec-footer", "mt-6 text-xs", highContrast ? "text-gray-400" : "text-slate-500")}> 
           {tr(language, "tip")}        

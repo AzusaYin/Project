@@ -10,8 +10,10 @@ from .schemas import ChatRequest, ChatAnswer, IngestResponse, FeedbackIn
 from .rag import Index, Embedder, hybrid_retrieve, build_prompt, format_citations, ingest_corpus
 from .llm_client import smartcare_chat, smartcare_chat_stream, smartcare_translate_to_en
 from .security import require_bearer
+from .admin_docs import router as admin_docs_router
 
 app = FastAPI(title="ElderlyCare HK — Backend")
+app.include_router(admin_docs_router)
 _CITE_TAG_RE = re.compile(r"\[Source\s+(\d+)\]")
 
 # 英/中政策名与常见后缀

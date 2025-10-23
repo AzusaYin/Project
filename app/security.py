@@ -1,4 +1,3 @@
-# app/security.py
 import base64, os
 from fastapi import HTTPException, Request
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -23,7 +22,7 @@ def _get_aesgcm():
         return None
     key = base64.urlsafe_b64decode(key_b64)
     return AESGCM(key)
-
+        
 def encrypt_bytes(plain: bytes) -> bytes:
     from secrets import token_bytes
     aes = _get_aesgcm()
