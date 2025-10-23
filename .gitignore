@@ -1,0 +1,28 @@
+# ---- secrets & data ----
+.env
+data/index/**
+data/feedback/**
+# 如果你不想把原始文档传上去，可按需加：
+# data/docs/**
+# data/docs_raw/**
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.envrc
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Node/Vite front-end ----
+frontend/node_modules/
+frontend/dist/
+node_modules/
+dist/
+
+# ---- Editors/OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
