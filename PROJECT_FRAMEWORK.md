@@ -1,15 +1,18 @@
+
 # ============================================================================
 # File: app/admin_docs.py
 # ============================================================================
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pathlib import Path
 import shutil, json, time, os, tempfile
+import asyncio
 from typing import List, Dict, Any
-import os, tempfile
 
+from .settings import settings
+from .rag import ingest_corpus
 from .security import require_bearer
 from .ingest_manager import start as ingest_start, cancel as ingest_cancel, status as ingest_status
-from .settings import settings
+
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 
@@ -28,28 +31,32 @@ def _write_status(payload: Dict[str, Any]) -> None:
         tmpname = tf.name
     os.replace(tmpname, STATUS_PATH)
 
-# def _reindex_job(note: str):
-#     _write_status({"status": "indexing", "note": note, "start_ts": int(time.time())})
-#     try:
-#         # ingest_corpus 可以是同步函数；若你实现的是 async，可在这里用 anyio.run 调用
-#         if asyncio.iscoroutinefunction(ingest_corpus):
-#             import anyio
-#             anyio.run(ingest_corpus)
-#         else:
-#             ingest_corpus()
-#         _write_status({"status": "ready", "note": note, "last_built": int(time.time())})
-#     except Exception as e:
-#         _write_status({"status": "error", "note": f"{note}: {e}", "ts": int(time.time())})
+def _reindex_job(note: str):
+    _write_status({"status": "indexing", "note": note, "start_ts": int(time.time())})
+    try:
+        # ingest_corpus 可以是同步函数；若你实现的是 async，可在这里用 anyio.run 调用
+        if asyncio.iscoroutinefunction(ingest_corpus):
+            import anyio
+            anyio.run(ingest_corpus)
+        else:
+            ingest_corpus()
+        _write_status({"status": "ready", "note": note, "last_built": int(time.time())})
+    except Exception as e:
+        _write_status({"status": "error", "note": f"{note}: {e}", "ts": int(time.time())})
 
 @router.get("/status", dependencies=[Depends(require_bearer)])
 def get_status():
-    return ingest_status()
+    if STATUS_PATH.exists():
+        try:
+            return json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"status": "unknown"}
+    return {"status": "ready"}
 
 @router.get("/list", dependencies=[Depends(require_bearer)])
 def list_docs():
-    items: List[Dict[str, Any]] = []
-    # 同时列出 md / markdown / pdf（若你只用 md，可去掉 pdf）
-    for p in sorted(list(DOCS_DIR.glob("*.md")) + list(DOCS_DIR.glob("*.markdown")) + list(DOCS_DIR.glob("*.pdf"))):
+    items = []
+    for p in sorted(list(DOCS_DIR.glob("*.md")) + list(DOCS_DIR.glob("*.markdown"))):
         items.append({
             "filename": p.name,
             "size": p.stat().st_size,
@@ -62,29 +69,76 @@ async def upload_doc(file: UploadFile = File(...)):
     name = (file.filename or "").lower()
     if not (name.endswith(".md") or name.endswith(".markdown")):  # 如需同时支持 pdf，可加 or name.endswith(".pdf")
         raise HTTPException(400, "Only Markdown (.md/.markdown) is supported")
+    
     tmp_path = TMP_DIR / (file.filename + ".part")
     with tmp_path.open("wb") as f:
         shutil.copyfileobj(file.file, f)
     dest = DOCS_DIR / file.filename
     tmp_path.replace(dest)  # 原子移动
-    ok = ingest_start(f"uploaded: {file.filename}")
-    if not ok:
-        return {"ok": True, "message": "Indexing already running. Your file is saved and will be included in the next build."}
-    return {"ok": True, "message": f"{file.filename} uploaded. Reindex started."}
+
+    # ===== 状态：indexing =====
+    _write_status({"status": "indexing", "note": f"uploaded: {file.filename}", "start_ts": int(time.time())})
+   
+    # —— 关键：同步重建（阻塞直到完成）——
+    # 若 ingest_corpus 是 CPU/IO 密集，同步调用会卡住 event loop；
+    # 用 asyncio.to_thread 让其在线程池执行，但这里依然“等它完成再返回”，体验等价于阻塞式。
+    await asyncio.to_thread(ingest_corpus, settings.docs_dir, settings.index_dir)
+
+    # 关键：失效内存索引缓存
+    from . import main as _main
+    _main._index = None
+    _main._embedder = None
+
+    # ===== 状态：ready =====
+    _write_status({"status": "ready", "note": f"uploaded: {file.filename}", "last_built": int(time.time())})
+    return {"ok": True, "message": f"{file.filename} uploaded. Index rebuilt (hot-loaded)."}
 
 @router.delete("/{filename}", dependencies=[Depends(require_bearer)])
-def delete_doc(filename: str):    
+async def delete_doc(filename: str):
+    # 基础校验，阻止路径穿越
     if "/" in filename or "\\" in filename:
         raise HTTPException(400, "Bad filename")
-    path = DOCS_DIR / filename
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    path.unlink()
-    ok = ingest_start(f"deleted: {filename}")
-    if not ok:
-        return {"ok": True, "message": "Indexing already running. Delete will take effect on next build."}
-    return {"ok": True, "message": f"{filename} deleted. Reindex started."}
 
+    # 允许省略后缀、大小写不敏感匹配
+    candidates = [
+        DOCS_DIR / filename,
+        DOCS_DIR / (filename if filename.lower().endswith(".md") else filename + ".md"),
+        DOCS_DIR / (filename if filename.lower().endswith(".markdown") else filename + ".markdown"),
+    ]
+
+    # 如果都不存在，尝试在目录里做一次“大小写不敏感”/近似匹配
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        low = filename.lower()
+        for p in DOCS_DIR.glob("*"):
+            if p.name.lower() == low or p.name.lower() == (low + ".md") or p.name.lower() == (low + ".markdown"):
+                path = p
+                break
+
+    # 能找到就删，找不到也继续重建（保证索引与磁盘一致）
+    if path and path.exists():
+        path.unlink()
+    
+    # —— 状态：indexing ——
+    _write_status({"status": "indexing", "note": f"deleted: {filename}", "start_ts": int(time.time())})
+
+    try:
+        # —— 同步重建（热加载）——
+        await asyncio.to_thread(ingest_corpus, settings.docs_dir, settings.index_dir)
+
+        # 关键：失效内存索引缓存
+        from . import main as _main
+        _main._index = None
+        _main._embedder = None
+
+        # —— 状态：ready ——
+        _write_status({"status": "ready", "note": f"deleted: {filename}", "last_built": int(time.time())})
+        return {"ok": True, "message": f"{filename} deleted (if existed). Index rebuilt (hot-loaded)."}
+    except Exception as e:
+        # —— 状态：error（可在前端提示）——
+        _write_status({"status": "error", "note": f"deleted: {filename}: {e}", "ts": int(time.time())})
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
+        
 @router.post("/cancel", dependencies=[Depends(require_bearer)])
 def cancel_reindex():
     killed = ingest_cancel()
@@ -251,9 +305,10 @@ async def smartcare_translate_to_en(text: str) -> str:
 # File: app/main.py
 # ============================================================================
 import uvicorn
+import numpy as np
 import re, json, time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -266,16 +321,10 @@ from .admin_docs import router as admin_docs_router
 
 app = FastAPI(title="ElderlyCare HK — Backend")
 app.include_router(admin_docs_router)
-_CITE_TAG_RE = re.compile(r"\[Source\s+(\d+)\]")
 
-# 英/中政策名与常见后缀
-_ENTITY_PAT = re.compile(
-    r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s(?:Allowance|Scheme|Manual|Programme|Grant|Service|Subvention|System))\b"
-    r"|(?:Old Age Allowance|Old Age Living Allowance|Operating Subvented Welfare|LSG Subvention Manual)"
-    r"|(?:長者生活津貼|高齡津貼|老年津貼|資助福利服務|統一撥款|資助手冊|計劃|津貼|手冊)",
-    re.I
-)
+_CITE_TAG_RE = re.compile(r"\[Source\s+(\d+)\]")
 _PRONOUN_PAT = re.compile(r"\b(it|its|this|that|they|their)\b|[它其這該]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")  # 基本漢字
 
 # 简单别名映射（可继续补充）
 ALIASES = {
@@ -285,15 +334,96 @@ ALIASES = {
     "LSGSS": "Lump Sum Grant Subvention System",
 }
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")  # 基本漢字
-
-# —— 从文本中抽取“政策/計劃/津貼/手冊”等名稱 —— 
+# 用“非字母数字”前后视图替代 \b，避免在中文里失效
+# (?<![A-Za-z0-9]) …… (?![A-Za-z0-9])
 _ENTITY_EXTRACT_RE = re.compile(
-    r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,7}\s(?:Allowance|Scheme|Manual|Programme|Grant|Service|Subvention|System|Policy))\b"
-    r"|(?:Old Age Allowance|Old Age Living Allowance|Disability Allowance|Comprehensive Social Security Assistance)"
-    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|綜合社會保障援助|資助福利服務|統一撥款|資助手冊|撥款制度|政策|計劃|津貼|手冊)",
-    re.I
+    r"(?<![A-Za-z0-9])("                                   # 英文正式名稱（首字母大寫的多詞短語 + 後綴）
+    r"[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,7}\s"
+    r"(?:Allowance|Scheme|Program|Programme|Manual|Handbook|Guide|Guidance\s+Notes|Notes|Policy|"
+    r"Ordinance|Regulation|Circular|Arrangement|Grant|Service|Subvention|System|Framework|Code|"
+    r"Plan|Charter|Protocol|Directive|Guideline)s?"         # 允許可選複數 s
+    r")(?![A-Za-z0-9])"
+    r"|(?:Old\s+Age\s+Allowance|Old\s+Age\s+Living\s+Allowance|Disability\s+Allowance|"
+    r"Comprehensive\s+Social\s+Security\s+Assistance)"      # 常見英文全名
+    r"|(?:OAA|OALA|CSSA|DA|LSG|LSGSS)"                      # 常見英文縮寫
+    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|"
+    r"綜合社會保障援助|資助福利服務|統一撥款|資助手冊|撥款制度|"
+    r"政策|計劃|津貼|手冊|指引|通告|規例|條例|方案|制度|安排)"  # 繁中後綴/同義詞擴充
+    , re.I
 )
+
+# 這個比上面的稍窄，用於你的“實體提示/澄清”檢測（不需要過多干擾詞）
+_ENTITY_PAT = re.compile(
+    r"(?<![A-Za-z0-9])("
+    r"[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s"
+    r"(?:Allowance|Scheme|Program|Programme|Manual|Handbook|Policy|Ordinance|Regulation|"
+    r"Guideline|Circular|Grant|Service|Subvention|System)s?"
+    r")(?![A-Za-z0-9])"
+    r"|(?:Old\s+Age\s+Allowance|Old\s+Age\s+Living\s+Allowance|Operating\s+Subvented\s+Welfare|"
+    r"LSG\s+Subvention\s+Manual|Disability\s+Allowance|Comprehensive\s+Social\s+Security\s+Assistance)"
+    r"|(?:OAA|OALA|CSSA|DA|LSG|LSGSS)"
+    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|資助福利服務|統一撥款|資助手冊|"
+    r"撥款制度|計劃|津貼|手冊|指引|通告|規例|條例|制度)"
+    , re.I
+)
+
+# --- Helpers for zh-Hant queries ---
+def _merge_dedup_hits(h1: list[dict], h2: list[dict], k: int) -> list[dict]:
+    """以 (file, page, chunk_id) 去重；分数取较大值；保留来源标记便于调试"""
+    seen = {}
+    for src, tag in ((h1, "zh"), (h2, "en")):
+        for h in (src or []):
+            key = (h.get("file"), h.get("page"), h.get("chunk_id"))
+            score = float(h.get("score", 0))
+            if key not in seen or score > seen[key]["score"]:
+                seen[key] = {**h, "score": score, "src": tag}
+    return sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:k]
+
+def _expand_aliases_zh(q: str) -> str:
+    """把繁中的俗称/简称扩成 (A OR B OR 英文名)；你可把表慢慢补充起来"""
+    table = {
+        "生果金": ["高齡津貼", "Old Age Allowance", "OAA"],
+        "綜援": ["綜合社會保障援助", "Comprehensive Social Security Assistance", "CSSA"],
+    }
+    # 先处理繁中文本
+    for k, vs in table.items():
+        if k in q:
+            q = q.replace(k, f"({ ' OR '.join([k] + vs) })")
+    # 再套用你现有的英文缩写表
+    for short, full in ALIASES.items():
+        if short in q:
+            q = q.replace(short, f"({short} OR {full})")
+    return q
+
+def _norm_for_entity(s: str) -> str:
+    # 全角->半角 + 去掉多餘空白
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000: code = 0x20
+        elif 0xFF01 <= code <= 0xFF5E: code -= 0xFEE0
+        out.append(chr(code))
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+def _extract_focus_phrase(s: str) -> str | None:
+    s = _norm_for_entity(s or "")
+    # 书名号优先：如《津貼及服務協議》
+    m = re.search(r"《(.+?)》", s)
+    if m: return m.group(1).strip()
+    # 退化：连续大写开头词 + 关键尾词（Accounts/Allowance/Manual/...）
+    m = re.search(r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s(?:Accounts?|Allowance|Manual|Programme|Scheme|Policy|System|Subvention))", s)
+    return m.group(1).strip() if m else None
+
+def _boost_by_phrase(contexts: list[dict], phrase: str | None, boost: float = 0.35) -> list[dict]:
+    if not phrase: 
+        return contexts
+    for c in contexts:
+        t = (c.get("text") 
+             or (c.get("meta") or {}).get("text") 
+             or "")
+        if t and phrase in t:
+            c["score"] = float(c.get("score", 0.0)) + boost
+    return sorted(contexts, key=lambda x: float(x.get("score", 0.0)), reverse=True)
 
 def _extract_entities_from_text(text: str) -> list[str]:
     if not text: 
@@ -333,14 +463,34 @@ def _suggest_entities_for(query: str, idx: "Index", emb: "Embedder", top_k: int 
 
 def _looks_cjk(s: str) -> bool:
     return bool(_CJK_RE.search(s or ""))
-
-import numpy as np
 # 轻量启发式参数
 _MIN_TOKENS = 3
 _GENERIC_Q_RE = re.compile(
     r"^(what|how|why|tell me|can you|could you|explain|give me|i want to know|說說|介紹|解釋|請講講|我想知道)\b",
     re.I,
 )
+
+def _looks_specific(q: str, contexts: list[dict]) -> bool:
+    """
+    返回 True 表示“这个查询已经足够具体”，不要再触发澄清。
+    判据：
+      - 含《》书名号（通常是确指标题）
+      - 命中你定义的实体正则（政策/津贴名等）
+      - 在 topN 候选文本里出现了原样短语（严格包含）
+    """
+    qn = _norm_for_entity(q)
+    if "《" in qn and "》" in qn: return True
+    if _ENTITY_PAT.search(qn):    return True
+    inner = None
+    m = re.search(r"《(.+?)》", qn)
+    if m: inner = m.group(1).strip()
+    phrase = (inner or qn).strip()
+    if phrase:
+        for c in contexts[:10]:
+            t = (c.get("text") or (c.get("meta") or {}).get("text") or "")
+            if t and phrase in t:
+                return True
+    return False
 
 def _tokenize_simple(s: str) -> list[str]:
     return [t for t in re.findall(r"\w+|[\u4e00-\u9fff]", s or "") if t.strip()]
@@ -375,6 +525,8 @@ _GENERIC_TEMPLATES = [
 ]
 
 _GENERIC_EMB: np.ndarray | None = None  # 懒加载缓存
+
+
 
 def _ensure_generic_emb() -> np.ndarray:
     global _GENERIC_EMB
@@ -450,18 +602,22 @@ def _expand_aliases(text: str) -> str:
     return out
 
 def _guess_entity_from_history(msgs: list[dict]) -> str | None:
-    # 从后往前找最近出现的“明确名词”，优先 assistant，再到 user
+    """從對話歷史中猜測最近出現的明確政策/津貼名（支援繁中與全角）"""
     for m in reversed(msgs):
         txt = _expand_aliases((m.get("content") or "").strip())
         if not txt:
             continue
-        hit = _ENTITY_PAT.search(txt)
+        # 🔹在匹配前做正規化
+        normed = _norm_for_entity(txt)
+        hit = _ENTITY_PAT.search(normed)
         if hit:
             return hit.group(0)
-    # 如果还没有，最后退回到首问中的名词
+
+    # 若仍未命中，退回首輪訊息再試
     for m in msgs:
         txt = _expand_aliases((m.get("content") or "").strip())
-        hit = _ENTITY_PAT.search(txt)
+        normed = _norm_for_entity(txt)
+        hit = _ENTITY_PAT.search(normed)
         if hit:
             return hit.group(0)
     return None
@@ -748,10 +904,38 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
             # 不粗暴替换用户原句，只给检索信号加注释
             user_query = f"{user_query} (about {ent})"
     
-    # 3) 用改写后的独立问题进行检索
+    # 3) 用改写后的独立问题进行检索（繁中：原文 + 英译 双通道合并）
     is_followup_pronoun = bool(_PRONOUN_PAT.search(msgs[-1]["content"]))
-    contexts = hybrid_retrieve(user_query, idx, emb, settings.top_k, soft=is_followup_pronoun)
-    
+
+    if req.language == "zh-Hant":
+        # 3.1 别名/俗称扩展（只影响检索，不改动原 messages）
+        query_zh = _expand_aliases_zh(user_query)
+
+        # 3.2 同时用繁中与英译检索
+        try:
+            query_en = await smartcare_translate_to_en(query_zh)
+        except Exception:
+            query_en = None
+
+        hits_zh = hybrid_retrieve(query_zh, idx, emb, settings.top_k, soft=is_followup_pronoun)
+        hits_en = hybrid_retrieve(query_en, idx, emb, settings.top_k, soft=True) if query_en else []
+
+        # 3.3 合并去重（保留较高分，截到 top_k）
+        contexts = _merge_dedup_hits(hits_zh, hits_en, settings.top_k)
+
+        # （可选）把“实际用于检索的 query”记下来便于日志排查
+        user_query = query_zh
+    else:
+        contexts = hybrid_retrieve(user_query, idx, emb, settings.top_k, soft=is_followup_pronoun)
+
+    # 从“当前问句”和“上一个问句/回答”中抓一个焦点短语
+    focus = (_extract_focus_phrase(msgs[-1]["content"]) or
+            (len(msgs) >= 2 and _extract_focus_phrase(msgs[-2]["content"])) or
+            _guess_entity_from_history(msgs))
+
+    # 按焦点短语重排（把包含该短语的分片往前推）
+    contexts = _boost_by_phrase(contexts, focus, boost=0.35)
+
     # === 先判斷是否找得到來源 ===
     if len(contexts) < settings.min_sources_required:
         text = _not_found_text(req.language)
@@ -762,20 +946,9 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
             return StreamingResponse(event_stream(), media_type="text/plain")
         else:
             return ChatAnswer(answer=text, citations=[])
-
-    # # 若命中不足，且疑似 CJK 查詢 → 翻譯成英文後重試一次
-    # if len(contexts) < settings.min_sources_required and _looks_cjk(user_query):
-    #     try:
-    #         q_en = await smartcare_translate_to_en(user_query)
-    #         contexts2 = hybrid_retrieve(q_en, idx, emb, settings.top_k, soft=True)
-    #         if len(contexts2) >= len(contexts):
-    #             user_query = q_en  # 記錄實際用來檢索的查詢
-    #             contexts = contexts2
-    #     except Exception:
-    #         pass
     
     # === 再檢查是否過於籠統（但已有來源） ===
-    if _should_clarify_smart(user_query):
+    if _should_clarify_smart(user_query) and not _looks_specific(user_query, contexts):
         text = _clarify_question_smart(user_query, req.language, idx, emb)
         if req.stream:
             async def event_stream():
@@ -785,18 +958,24 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
         else:
             return ChatAnswer(answer=text, citations=[])
 
-
     # 4) 正常拼 prompt（把原 messages 发给模型，这样它能“按上下文口吻”回答）
     prompt_msgs = build_prompt(msgs, contexts)
     if req.language == "zh-Hant":
         prompt_msgs.insert(0, {
             "role": "system",
-            "content": "請使用繁體中文回答所有問題。"
+            "content": (
+                "請使用繁體中文回答所有問題，"
+                "語氣親切、句子簡短，避免使用艱深詞彙，"
+                "讓長者能容易明白。"
+            )
         })
     elif req.language == "en":
         prompt_msgs.insert(0, {
             "role": "system",
-            "content": "Please answer in English."
+            "content": (
+                "Please answer in clear, short English sentences suitable for older adults. "
+                "Avoid jargon and keep the response friendly."
+            )
         })
 
     if req.stream:
@@ -865,6 +1044,7 @@ import json
 import threading
 import faiss
 import numpy as np
+import re
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
@@ -964,6 +1144,47 @@ def simple_char_chunk(text: str, chunk_size: int, overlap: int) -> List[str]:
         return []
     return [text[i:i+chunk_size] for i in range(0, n, step)]
 
+# --- Sentence-aware chunking for CJK ---
+_SENT_SPLIT = re.compile(r"[。！？；：]\s*")  # 粗粒度分句
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    # 先按中文标点粗分句，再在每个句段内二次裁切
+    parts = []
+    segs = [s for s in _SENT_SPLIT.split(text) if s]
+    for seg in segs:
+        parts.extend(simple_char_chunk(seg, chunk_size, overlap))
+    if not segs:  # 没分出来就退回原策略
+        parts = simple_char_chunk(text, chunk_size, overlap)
+    return parts
+
+# --- Tokenization (CJK-friendly) ---
+
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+def _to_halfwidth(s: str) -> str:
+    # 全角转半角（常见中文数字/标点）
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000:  # 全角空格
+            code = 0x20
+        elif 0xFF01 <= code <= 0xFF5E:
+            code -= 0xFEE0
+        out.append(chr(code))
+    return "".join(out)
+
+def tokenize(text: str) -> list[str]:
+    # 轻量标准化
+    text = _to_halfwidth(text)
+    if _CJK.search(text):
+        # 2-gram + 3-gram，适配繁中/简中
+        s = re.sub(r"\s+", "", text)
+        toks2 = [s[i:i+2] for i in range(len(s)-1)] if len(s) >= 2 else ([s] if s else [])
+        toks3 = [s[i:i+3] for i in range(len(s)-2)] if len(s) >= 3 else []
+        return toks2 + toks3
+    # 英文/数字：保留原逻辑但更稳健的正则
+    return re.findall(r"[A-Za-z0-9_]+", text.lower())
+
 # --- Ingestion ---
 def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
     docs = read_markdown_files(docs_dir)
@@ -976,7 +1197,7 @@ def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
         print(f"[ingest] doc {di}/{len(docs)} -> {len(page_ranges)} page(s) (logical)")
         for pr in page_ranges:
             page_text = doc["text"][pr["start"]:pr["end"]]
-            pieces = simple_char_chunk(page_text, settings.chunk_size, settings.chunk_overlap)
+            pieces = chunk_text(page_text, settings.chunk_size, settings.chunk_overlap)
             for i, piece in enumerate(pieces):
                 meta = {"file": doc["path"], "page": pr["page"], "chunk_id": i, "text": piece}
                 all_chunks.append(Chunk(text=piece, meta=meta))
@@ -998,7 +1219,7 @@ def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
     embeddings = np.vstack(emb_list).astype(np.float32)
     print(f"[ingest] embedding done, shape={embeddings.shape}")
 
-    bm25_tokens = [t.lower().split() for t in texts] if settings.enable_bm25 else None
+    bm25_tokens = [tokenize(t) for t in texts] if settings.enable_bm25 else None
 
     meta = [c.meta for c in all_chunks]
     index = Index(index_dir)
@@ -1040,69 +1261,117 @@ def _load_penalty() -> dict:
         return _PENALTY or {}
 
 def hybrid_retrieve(query: str, index: Index, embedder: Embedder, k: int, *, soft: bool=False) -> List[Dict]:
+    import re
+    _CJK = re.compile(r"[\u4e00-\u9fff]")
+
+    def _tokenize_q(q: str) -> List[str]:
+        # 轻量规范：全角->半角，压缩空白
+        def _to_halfwidth(s: str) -> str:
+            out = []
+            for ch in s:
+                code = ord(ch)
+                if code == 0x3000:  # 全角空格
+                    code = 0x20
+                elif 0xFF01 <= code <= 0xFF5E:
+                    code -= 0xFEE0
+                out.append(chr(code))
+            return re.sub(r"\s+", " ", "".join(out)).strip()
+
+        s = _to_halfwidth(q)
+        if _CJK.search(s):
+            s = s.replace(" ", "")
+            toks2 = [s[i:i+2] for i in range(len(s)-1)] if len(s) >= 2 else ([s] if s else [])
+            toks3 = [s[i:i+3] for i in range(len(s)-2)] if len(s) >= 3 else []
+            return toks2 + toks3
+        # 英文/数字：单词正则更稳
+        return re.findall(r"[A-Za-z0-9_]+", s.lower())
+
+    is_cjk = bool(_CJK.search(query))
     q_emb = embedder.encode([query])
 
     # 向量检索
-    vec_hits = []
+    vec_hits: List[Tuple[int, float]] = []
     if index.faiss is not None and index.faiss.ntotal > 0:
-        D, I = index.faiss.search(q_emb.astype(np.float32), max(k, 5))
-        # D 即内积；因为我们归一化过等价于余弦相似度
+        D, I = index.faiss.search(q_emb.astype(np.float32), max(k, 50))
         vec_hits = [(int(I[0][i]), float(D[0][i])) for i in range(len(I[0]))]
 
-    # BM25
-    bm25_hits = []
+    # BM25（中文分词改造）
+    bm25_hits: List[Tuple[int, float]] = []
     if index.bm25 is not None and index.bm25_corpus_tokens:
-        scores = index.bm25.get_scores(query.lower().split())
-        top_ids = np.argsort(scores)[::-1][:max(k, 5)]
-        bm25_hits = [(int(i), float(scores[i])) for i in top_ids]
+        q_tokens = _tokenize_q(query)
+        if q_tokens:
+            scores = index.bm25.get_scores(q_tokens)
+            top_ids = np.argsort(scores)[::-1][:max(k, 50)]
+            bm25_hits = [(int(i), float(scores[i])) for i in top_ids]
 
-    # 合并分数（轻量级加权）
+    # 合并分数（权重随 CJK 调整）
+    # 中文：BM25 更重要；英文：向量为主
+    alpha_vec = 0.60 if is_cjk else 0.90
+    alpha_bm25 = 0.40 if is_cjk else 0.10
+
     score_map: Dict[int, Dict[str, float]] = {}
-    for rank, (idx_i, sim) in enumerate(vec_hits):
-        m = score_map.setdefault(idx_i, {"vec": 0.0, "bm25": 0.0})
-        m["vec"] = max(m["vec"], sim)  # 取最大相似度更稳
-    for rank, (idx_i, s) in enumerate(bm25_hits):
-        m = score_map.setdefault(idx_i, {"vec": 0.0, "bm25": 0.0})
+    for idx_i, sim in vec_hits:
+        m = score_map.setdefault(idx_i, {"vec": -1e9, "bm25": -1e9})
+        m["vec"] = max(m["vec"], sim)
+    for idx_i, s in bm25_hits:
+        m = score_map.setdefault(idx_i, {"vec": -1e9, "bm25": -1e9})
         m["bm25"] = max(m["bm25"], s)
 
-    vec_thr = settings.min_vec_sim * (0.7 if soft else 1.0)
-    bm25_thr = settings.min_bm25_score * (0.6 if soft else 1.0)
+    # 自适应阈值
+    vec_thr = settings.min_vec_sim * (0.7 if (soft or is_cjk) else 1.0)
+    bm25_thr = settings.min_bm25_score * (0.6 if (soft or is_cjk) else 1.0)
 
-    # 读取一次（模块级全局缓存）
+    # 书名号短语（如《津貼及服務協議》）用于加权
+    phrase_boost = 0.35 if is_cjk else 0.20
+    m_phrase = re.search(r"《(.+?)》", query)
+    phrase = m_phrase.group(1).strip() if m_phrase else None
+
+    # 读取一次惩罚表
     _PENALTY = None
     def _load_penalty():
-        global _PENALTY
+        nonlocal _PENALTY
         if _PENALTY is None:
-            from pathlib import Path, PurePath
+            from pathlib import Path
             p = Path("data/feedback/penalty.json")
             _PENALTY = json.loads(p.read_text("utf-8")) if p.exists() else {}
         return _PENALTY
 
-    # 阈值过滤（任一信号达标才保留）
+    # 阈值过滤 + 融合 + phrase 加权 + 惩罚
     passed: List[Tuple[int, float]] = []
     pen = _load_penalty()
     for idx_i, sig in score_map.items():
-        if (sig["vec"] >= vec_thr) or (sig["bm25"] >= bm25_thr):
-            # 基础融合分
-            combo = (sig["vec"] * 1.0) + (sig["bm25"] * 0.05)
+        vec_ok = (sig["vec"] >= vec_thr)
+        bm_ok = (sig["bm25"] >= bm25_thr)
+        if not (vec_ok or bm_ok):
+            continue
 
-            # 应用惩罚：对常被👎的 (file,page) 降权
-            meta = index.meta[idx_i]
-            key = f"{Path(meta['file']).name}::{meta.get('page')}"
-            penalty = float(pen.get(key, 0.0))  # 例如 0.15~0.30
-            combo -= penalty
+        # 基础融合分（注意：FAISS D 已是余弦，BM25 是原始分）
+        combo = alpha_vec * max(sig["vec"], 0.0) + alpha_bm25 * max(sig["bm25"], 0.0)
 
-            passed.append((idx_i, combo))
+        # 书名号短语命中加权
+        meta = index.meta[idx_i]
+        meta_text = meta.get("text") or (index.texts[idx_i] if hasattr(index, "texts") and index.texts else "")
+        if phrase and meta_text and phrase in meta_text:
+            combo += phrase_boost
+
+        # 应用惩罚（👎反馈）
+        from pathlib import Path
+        key = f"{Path(meta['file']).name}::{meta.get('page')}"
+        penalty = float(pen.get(key, 0.0))  # 例如 0.15~0.30
+        combo -= penalty
+
+        passed.append((idx_i, combo))
 
     # 排序+截断
     passed.sort(key=lambda x: x[1], reverse=True)
     passed = passed[:k]
 
-    # 若过滤后为空，表示“不足以作为来源”
-    results = []
+    # 出结果：补齐 text 字段，便于后续逻辑判断与渲染
+    results: List[Dict] = []
     for idx_i, combo in passed:
         meta = index.meta[idx_i]
-        results.append({"text": None, "meta": meta, "idx": idx_i, "score": combo})
+        text = meta.get("text") or (index.texts[idx_i] if hasattr(index, "texts") and index.texts else None)
+        results.append({"text": text, "meta": meta, "idx": idx_i, "score": float(combo)})
     return results
 
 # --- Prompt & Citations ---
@@ -1511,16 +1780,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 ## 4) Call the API
 
-> If the Server and the Client are not on the same machine, then it is required ```hostname -I``` in bash to get the IP address of server.
+> If the Server and the Client are not on the same machine, then it is required ```ip a | grep 'inet '``` in bash to get the IP address of server.
 
 ### Health
 ```bash
-curl http://localhost:8000/healthz
+curl http://localhost:8001/healthz
 ```
 
 ### Chat (non-stream)
 ```bash
-curl -X POST http://localhost:8003/chat \
+curl -X POST http://localhost:8001/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -1532,7 +1801,7 @@ curl -X POST http://localhost:8003/chat \
 
 ### Stream (raw lines)
 ```bash
-curl -N -X POST http://localhost:8000/chat \
+curl -N -X POST http://localhost:8001/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [

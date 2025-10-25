@@ -42,16 +42,16 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8001
 
 ## 4) Call the API
 
-> If the Server and the Client are not on the same machine, then it is required ```hostname -I``` in bash to get the IP address of server.
+> If the Server and the Client are not on the same machine, then it is required ```ip a | grep 'inet '``` in bash to get the IP address of server.
 
 ### Health
 ```bash
-curl http://localhost:8000/healthz
+curl http://localhost:8001/healthz
 ```
 
 ### Chat (non-stream)
 ```bash
-curl -X POST http://localhost:8003/chat \
+curl -X POST http://localhost:8001/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [
@@ -63,7 +63,7 @@ curl -X POST http://localhost:8003/chat \
 
 ### Stream (raw lines)
 ```bash
-curl -N -X POST http://localhost:8000/chat \
+curl -N -X POST http://localhost:8001/chat \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [

@@ -1,4 +1,3 @@
-// === App.tsx (with left sidebar: chat thread selector + rename + Enter-to-send) ===
 import React, { useEffect, useMemo, useRef, useState, Suspense} from "react";
 import AdminDocs from "./AdminDocs";
 import ReactMarkdown from "react-markdown";
@@ -80,7 +79,7 @@ const I18N = {
     helpful: "有幫助",
     notHelpful: "沒有幫助",
     sources: "來源：",
-    emptyHint: "可詢問香港安老政策相關問題。範例：「解釋非政府機構的公眾問責性。」",
+    emptyHint: "可詢問香港安老政策相關問題。範例：「解釋整筆撥款津助制度。」",
     tip: "提示：ElderlyCare 亦可能出錯，重要資訊請再次核對。",
   },
 } as const;
@@ -305,7 +304,7 @@ function injectFallbackCSS() {
 
   /* ===== Normal Mode: Sources Section ===== */
   .ec-sources { 
-    font-size: inherit; 
+    font-size: iffnherit; 
     line-height: 1.55;
   }
   .ec-sources li { line-height: 1.55; }

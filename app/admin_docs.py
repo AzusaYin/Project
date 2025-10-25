@@ -80,14 +80,18 @@ async def upload_doc(file: UploadFile = File(...)):
     # 用 asyncio.to_thread 让其在线程池执行，但这里依然“等它完成再返回”，体验等价于阻塞式。
     await asyncio.to_thread(ingest_corpus, settings.docs_dir, settings.index_dir)
 
+    # 关键：失效内存索引缓存
+    from . import main as _main
+    _main._index = None
+    _main._embedder = None
+
     # ===== 状态：ready =====
     _write_status({"status": "ready", "note": f"uploaded: {file.filename}", "last_built": int(time.time())})
-
     return {"ok": True, "message": f"{file.filename} uploaded. Index rebuilt (hot-loaded)."}
 
 @router.delete("/{filename}", dependencies=[Depends(require_bearer)])
 async def delete_doc(filename: str):
-    # 基础校验
+    # 基础校验，阻止路径穿越
     if "/" in filename or "\\" in filename:
         raise HTTPException(400, "Bad filename")
 
@@ -110,12 +114,27 @@ async def delete_doc(filename: str):
     # 能找到就删，找不到也继续重建（保证索引与磁盘一致）
     if path and path.exists():
         path.unlink()
+    
+    # —— 状态：indexing ——
+    _write_status({"status": "indexing", "note": f"deleted: {filename}", "start_ts": int(time.time())})
 
-    # ——关键：同步重建，完成后再返回 200（热加载）——
-    await asyncio.to_thread(ingest_corpus, settings.docs_dir, settings.index_dir)
+    try:
+        # —— 同步重建（热加载）——
+        await asyncio.to_thread(ingest_corpus, settings.docs_dir, settings.index_dir)
 
-    return {"ok": True, "message": f"Deleted (if existed). Index rebuilt (hot-loaded)."}
+        # 关键：失效内存索引缓存
+        from . import main as _main
+        _main._index = None
+        _main._embedder = None
 
+        # —— 状态：ready ——
+        _write_status({"status": "ready", "note": f"deleted: {filename}", "last_built": int(time.time())})
+        return {"ok": True, "message": f"{filename} deleted (if existed). Index rebuilt (hot-loaded)."}
+    except Exception as e:
+        # —— 状态：error（可在前端提示）——
+        _write_status({"status": "error", "note": f"deleted: {filename}: {e}", "ts": int(time.time())})
+        raise HTTPException(status_code=500, detail=f"Reindex failed: {e}")
+        
 @router.post("/cancel", dependencies=[Depends(require_bearer)])
 def cancel_reindex():
     killed = ingest_cancel()

@@ -2,6 +2,7 @@ import json
 import threading
 import faiss
 import numpy as np
+import re
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
@@ -101,6 +102,47 @@ def simple_char_chunk(text: str, chunk_size: int, overlap: int) -> List[str]:
         return []
     return [text[i:i+chunk_size] for i in range(0, n, step)]
 
+# --- Sentence-aware chunking for CJK ---
+_SENT_SPLIT = re.compile(r"[。！？；：]\s*")  # 粗粒度分句
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    # 先按中文标点粗分句，再在每个句段内二次裁切
+    parts = []
+    segs = [s for s in _SENT_SPLIT.split(text) if s]
+    for seg in segs:
+        parts.extend(simple_char_chunk(seg, chunk_size, overlap))
+    if not segs:  # 没分出来就退回原策略
+        parts = simple_char_chunk(text, chunk_size, overlap)
+    return parts
+
+# --- Tokenization (CJK-friendly) ---
+
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+def _to_halfwidth(s: str) -> str:
+    # 全角转半角（常见中文数字/标点）
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000:  # 全角空格
+            code = 0x20
+        elif 0xFF01 <= code <= 0xFF5E:
+            code -= 0xFEE0
+        out.append(chr(code))
+    return "".join(out)
+
+def tokenize(text: str) -> list[str]:
+    # 轻量标准化
+    text = _to_halfwidth(text)
+    if _CJK.search(text):
+        # 2-gram + 3-gram，适配繁中/简中
+        s = re.sub(r"\s+", "", text)
+        toks2 = [s[i:i+2] for i in range(len(s)-1)] if len(s) >= 2 else ([s] if s else [])
+        toks3 = [s[i:i+3] for i in range(len(s)-2)] if len(s) >= 3 else []
+        return toks2 + toks3
+    # 英文/数字：保留原逻辑但更稳健的正则
+    return re.findall(r"[A-Za-z0-9_]+", text.lower())
+
 # --- Ingestion ---
 def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
     docs = read_markdown_files(docs_dir)
@@ -113,7 +155,7 @@ def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
         print(f"[ingest] doc {di}/{len(docs)} -> {len(page_ranges)} page(s) (logical)")
         for pr in page_ranges:
             page_text = doc["text"][pr["start"]:pr["end"]]
-            pieces = simple_char_chunk(page_text, settings.chunk_size, settings.chunk_overlap)
+            pieces = chunk_text(page_text, settings.chunk_size, settings.chunk_overlap)
             for i, piece in enumerate(pieces):
                 meta = {"file": doc["path"], "page": pr["page"], "chunk_id": i, "text": piece}
                 all_chunks.append(Chunk(text=piece, meta=meta))
@@ -135,7 +177,7 @@ def ingest_corpus(docs_dir: str, index_dir: str) -> Tuple[int, int]:
     embeddings = np.vstack(emb_list).astype(np.float32)
     print(f"[ingest] embedding done, shape={embeddings.shape}")
 
-    bm25_tokens = [t.lower().split() for t in texts] if settings.enable_bm25 else None
+    bm25_tokens = [tokenize(t) for t in texts] if settings.enable_bm25 else None
 
     meta = [c.meta for c in all_chunks]
     index = Index(index_dir)
@@ -177,69 +219,117 @@ def _load_penalty() -> dict:
         return _PENALTY or {}
 
 def hybrid_retrieve(query: str, index: Index, embedder: Embedder, k: int, *, soft: bool=False) -> List[Dict]:
+    import re
+    _CJK = re.compile(r"[\u4e00-\u9fff]")
+
+    def _tokenize_q(q: str) -> List[str]:
+        # 轻量规范：全角->半角，压缩空白
+        def _to_halfwidth(s: str) -> str:
+            out = []
+            for ch in s:
+                code = ord(ch)
+                if code == 0x3000:  # 全角空格
+                    code = 0x20
+                elif 0xFF01 <= code <= 0xFF5E:
+                    code -= 0xFEE0
+                out.append(chr(code))
+            return re.sub(r"\s+", " ", "".join(out)).strip()
+
+        s = _to_halfwidth(q)
+        if _CJK.search(s):
+            s = s.replace(" ", "")
+            toks2 = [s[i:i+2] for i in range(len(s)-1)] if len(s) >= 2 else ([s] if s else [])
+            toks3 = [s[i:i+3] for i in range(len(s)-2)] if len(s) >= 3 else []
+            return toks2 + toks3
+        # 英文/数字：单词正则更稳
+        return re.findall(r"[A-Za-z0-9_]+", s.lower())
+
+    is_cjk = bool(_CJK.search(query))
     q_emb = embedder.encode([query])
 
     # 向量检索
-    vec_hits = []
+    vec_hits: List[Tuple[int, float]] = []
     if index.faiss is not None and index.faiss.ntotal > 0:
-        D, I = index.faiss.search(q_emb.astype(np.float32), max(k, 5))
-        # D 即内积；因为我们归一化过等价于余弦相似度
+        D, I = index.faiss.search(q_emb.astype(np.float32), max(k, 50))
         vec_hits = [(int(I[0][i]), float(D[0][i])) for i in range(len(I[0]))]
 
-    # BM25
-    bm25_hits = []
+    # BM25（中文分词改造）
+    bm25_hits: List[Tuple[int, float]] = []
     if index.bm25 is not None and index.bm25_corpus_tokens:
-        scores = index.bm25.get_scores(query.lower().split())
-        top_ids = np.argsort(scores)[::-1][:max(k, 5)]
-        bm25_hits = [(int(i), float(scores[i])) for i in top_ids]
+        q_tokens = _tokenize_q(query)
+        if q_tokens:
+            scores = index.bm25.get_scores(q_tokens)
+            top_ids = np.argsort(scores)[::-1][:max(k, 50)]
+            bm25_hits = [(int(i), float(scores[i])) for i in top_ids]
 
-    # 合并分数（轻量级加权）
+    # 合并分数（权重随 CJK 调整）
+    # 中文：BM25 更重要；英文：向量为主
+    alpha_vec = 0.60 if is_cjk else 0.90
+    alpha_bm25 = 0.40 if is_cjk else 0.10
+
     score_map: Dict[int, Dict[str, float]] = {}
-    for rank, (idx_i, sim) in enumerate(vec_hits):
-        m = score_map.setdefault(idx_i, {"vec": 0.0, "bm25": 0.0})
-        m["vec"] = max(m["vec"], sim)  # 取最大相似度更稳
-    for rank, (idx_i, s) in enumerate(bm25_hits):
-        m = score_map.setdefault(idx_i, {"vec": 0.0, "bm25": 0.0})
+    for idx_i, sim in vec_hits:
+        m = score_map.setdefault(idx_i, {"vec": -1e9, "bm25": -1e9})
+        m["vec"] = max(m["vec"], sim)
+    for idx_i, s in bm25_hits:
+        m = score_map.setdefault(idx_i, {"vec": -1e9, "bm25": -1e9})
         m["bm25"] = max(m["bm25"], s)
 
-    vec_thr = settings.min_vec_sim * (0.7 if soft else 1.0)
-    bm25_thr = settings.min_bm25_score * (0.6 if soft else 1.0)
+    # 自适应阈值
+    vec_thr = settings.min_vec_sim * (0.7 if (soft or is_cjk) else 1.0)
+    bm25_thr = settings.min_bm25_score * (0.6 if (soft or is_cjk) else 1.0)
 
-    # 读取一次（模块级全局缓存）
+    # 书名号短语（如《津貼及服務協議》）用于加权
+    phrase_boost = 0.35 if is_cjk else 0.20
+    m_phrase = re.search(r"《(.+?)》", query)
+    phrase = m_phrase.group(1).strip() if m_phrase else None
+
+    # 读取一次惩罚表
     _PENALTY = None
     def _load_penalty():
-        global _PENALTY
+        nonlocal _PENALTY
         if _PENALTY is None:
-            from pathlib import Path, PurePath
+            from pathlib import Path
             p = Path("data/feedback/penalty.json")
             _PENALTY = json.loads(p.read_text("utf-8")) if p.exists() else {}
         return _PENALTY
 
-    # 阈值过滤（任一信号达标才保留）
+    # 阈值过滤 + 融合 + phrase 加权 + 惩罚
     passed: List[Tuple[int, float]] = []
     pen = _load_penalty()
     for idx_i, sig in score_map.items():
-        if (sig["vec"] >= vec_thr) or (sig["bm25"] >= bm25_thr):
-            # 基础融合分
-            combo = (sig["vec"] * 1.0) + (sig["bm25"] * 0.05)
+        vec_ok = (sig["vec"] >= vec_thr)
+        bm_ok = (sig["bm25"] >= bm25_thr)
+        if not (vec_ok or bm_ok):
+            continue
 
-            # 应用惩罚：对常被👎的 (file,page) 降权
-            meta = index.meta[idx_i]
-            key = f"{Path(meta['file']).name}::{meta.get('page')}"
-            penalty = float(pen.get(key, 0.0))  # 例如 0.15~0.30
-            combo -= penalty
+        # 基础融合分（注意：FAISS D 已是余弦，BM25 是原始分）
+        combo = alpha_vec * max(sig["vec"], 0.0) + alpha_bm25 * max(sig["bm25"], 0.0)
 
-            passed.append((idx_i, combo))
+        # 书名号短语命中加权
+        meta = index.meta[idx_i]
+        meta_text = meta.get("text") or (index.texts[idx_i] if hasattr(index, "texts") and index.texts else "")
+        if phrase and meta_text and phrase in meta_text:
+            combo += phrase_boost
+
+        # 应用惩罚（👎反馈）
+        from pathlib import Path
+        key = f"{Path(meta['file']).name}::{meta.get('page')}"
+        penalty = float(pen.get(key, 0.0))  # 例如 0.15~0.30
+        combo -= penalty
+
+        passed.append((idx_i, combo))
 
     # 排序+截断
     passed.sort(key=lambda x: x[1], reverse=True)
     passed = passed[:k]
 
-    # 若过滤后为空，表示“不足以作为来源”
-    results = []
+    # 出结果：补齐 text 字段，便于后续逻辑判断与渲染
+    results: List[Dict] = []
     for idx_i, combo in passed:
         meta = index.meta[idx_i]
-        results.append({"text": None, "meta": meta, "idx": idx_i, "score": combo})
+        text = meta.get("text") or (index.texts[idx_i] if hasattr(index, "texts") and index.texts else None)
+        results.append({"text": text, "meta": meta, "idx": idx_i, "score": float(combo)})
     return results
 
 # --- Prompt & Citations ---

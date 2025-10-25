@@ -1,7 +1,8 @@
 import uvicorn
+import numpy as np
 import re, json, time
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,16 +15,10 @@ from .admin_docs import router as admin_docs_router
 
 app = FastAPI(title="ElderlyCare HK — Backend")
 app.include_router(admin_docs_router)
-_CITE_TAG_RE = re.compile(r"\[Source\s+(\d+)\]")
 
-# 英/中政策名与常见后缀
-_ENTITY_PAT = re.compile(
-    r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s(?:Allowance|Scheme|Manual|Programme|Grant|Service|Subvention|System))\b"
-    r"|(?:Old Age Allowance|Old Age Living Allowance|Operating Subvented Welfare|LSG Subvention Manual)"
-    r"|(?:長者生活津貼|高齡津貼|老年津貼|資助福利服務|統一撥款|資助手冊|計劃|津貼|手冊)",
-    re.I
-)
+_CITE_TAG_RE = re.compile(r"\[Source\s+(\d+)\]")
 _PRONOUN_PAT = re.compile(r"\b(it|its|this|that|they|their)\b|[它其這該]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")  # 基本漢字
 
 # 简单别名映射（可继续补充）
 ALIASES = {
@@ -33,15 +28,96 @@ ALIASES = {
     "LSGSS": "Lump Sum Grant Subvention System",
 }
 
-_CJK_RE = re.compile(r"[\u4e00-\u9fff]")  # 基本漢字
-
-# —— 从文本中抽取“政策/計劃/津貼/手冊”等名稱 —— 
+# 用“非字母数字”前后视图替代 \b，避免在中文里失效
+# (?<![A-Za-z0-9]) …… (?![A-Za-z0-9])
 _ENTITY_EXTRACT_RE = re.compile(
-    r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,7}\s(?:Allowance|Scheme|Manual|Programme|Grant|Service|Subvention|System|Policy))\b"
-    r"|(?:Old Age Allowance|Old Age Living Allowance|Disability Allowance|Comprehensive Social Security Assistance)"
-    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|綜合社會保障援助|資助福利服務|統一撥款|資助手冊|撥款制度|政策|計劃|津貼|手冊)",
-    re.I
+    r"(?<![A-Za-z0-9])("                                   # 英文正式名稱（首字母大寫的多詞短語 + 後綴）
+    r"[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,7}\s"
+    r"(?:Allowance|Scheme|Program|Programme|Manual|Handbook|Guide|Guidance\s+Notes|Notes|Policy|"
+    r"Ordinance|Regulation|Circular|Arrangement|Grant|Service|Subvention|System|Framework|Code|"
+    r"Plan|Charter|Protocol|Directive|Guideline)s?"         # 允許可選複數 s
+    r")(?![A-Za-z0-9])"
+    r"|(?:Old\s+Age\s+Allowance|Old\s+Age\s+Living\s+Allowance|Disability\s+Allowance|"
+    r"Comprehensive\s+Social\s+Security\s+Assistance)"      # 常見英文全名
+    r"|(?:OAA|OALA|CSSA|DA|LSG|LSGSS)"                      # 常見英文縮寫
+    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|"
+    r"綜合社會保障援助|資助福利服務|統一撥款|資助手冊|撥款制度|"
+    r"政策|計劃|津貼|手冊|指引|通告|規例|條例|方案|制度|安排)"  # 繁中後綴/同義詞擴充
+    , re.I
 )
+
+# 這個比上面的稍窄，用於你的“實體提示/澄清”檢測（不需要過多干擾詞）
+_ENTITY_PAT = re.compile(
+    r"(?<![A-Za-z0-9])("
+    r"[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s"
+    r"(?:Allowance|Scheme|Program|Programme|Manual|Handbook|Policy|Ordinance|Regulation|"
+    r"Guideline|Circular|Grant|Service|Subvention|System)s?"
+    r")(?![A-Za-z0-9])"
+    r"|(?:Old\s+Age\s+Allowance|Old\s+Age\s+Living\s+Allowance|Operating\s+Subvented\s+Welfare|"
+    r"LSG\s+Subvention\s+Manual|Disability\s+Allowance|Comprehensive\s+Social\s+Security\s+Assistance)"
+    r"|(?:OAA|OALA|CSSA|DA|LSG|LSGSS)"
+    r"|(?:長者生活津貼|高齡津貼|老年津貼|傷殘津貼|資助福利服務|統一撥款|資助手冊|"
+    r"撥款制度|計劃|津貼|手冊|指引|通告|規例|條例|制度)"
+    , re.I
+)
+
+# --- Helpers for zh-Hant queries ---
+def _merge_dedup_hits(h1: list[dict], h2: list[dict], k: int) -> list[dict]:
+    """以 (file, page, chunk_id) 去重；分数取较大值；保留来源标记便于调试"""
+    seen = {}
+    for src, tag in ((h1, "zh"), (h2, "en")):
+        for h in (src or []):
+            key = (h.get("file"), h.get("page"), h.get("chunk_id"))
+            score = float(h.get("score", 0))
+            if key not in seen or score > seen[key]["score"]:
+                seen[key] = {**h, "score": score, "src": tag}
+    return sorted(seen.values(), key=lambda x: x["score"], reverse=True)[:k]
+
+def _expand_aliases_zh(q: str) -> str:
+    """把繁中的俗称/简称扩成 (A OR B OR 英文名)；你可把表慢慢补充起来"""
+    table = {
+        "生果金": ["高齡津貼", "Old Age Allowance", "OAA"],
+        "綜援": ["綜合社會保障援助", "Comprehensive Social Security Assistance", "CSSA"],
+    }
+    # 先处理繁中文本
+    for k, vs in table.items():
+        if k in q:
+            q = q.replace(k, f"({ ' OR '.join([k] + vs) })")
+    # 再套用你现有的英文缩写表
+    for short, full in ALIASES.items():
+        if short in q:
+            q = q.replace(short, f"({short} OR {full})")
+    return q
+
+def _norm_for_entity(s: str) -> str:
+    # 全角->半角 + 去掉多餘空白
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000: code = 0x20
+        elif 0xFF01 <= code <= 0xFF5E: code -= 0xFEE0
+        out.append(chr(code))
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+def _extract_focus_phrase(s: str) -> str | None:
+    s = _norm_for_entity(s or "")
+    # 书名号优先：如《津貼及服務協議》
+    m = re.search(r"《(.+?)》", s)
+    if m: return m.group(1).strip()
+    # 退化：连续大写开头词 + 关键尾词（Accounts/Allowance/Manual/...）
+    m = re.search(r"([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,6}\s(?:Accounts?|Allowance|Manual|Programme|Scheme|Policy|System|Subvention))", s)
+    return m.group(1).strip() if m else None
+
+def _boost_by_phrase(contexts: list[dict], phrase: str | None, boost: float = 0.35) -> list[dict]:
+    if not phrase: 
+        return contexts
+    for c in contexts:
+        t = (c.get("text") 
+             or (c.get("meta") or {}).get("text") 
+             or "")
+        if t and phrase in t:
+            c["score"] = float(c.get("score", 0.0)) + boost
+    return sorted(contexts, key=lambda x: float(x.get("score", 0.0)), reverse=True)
 
 def _extract_entities_from_text(text: str) -> list[str]:
     if not text: 
@@ -81,14 +157,34 @@ def _suggest_entities_for(query: str, idx: "Index", emb: "Embedder", top_k: int 
 
 def _looks_cjk(s: str) -> bool:
     return bool(_CJK_RE.search(s or ""))
-
-import numpy as np
 # 轻量启发式参数
 _MIN_TOKENS = 3
 _GENERIC_Q_RE = re.compile(
     r"^(what|how|why|tell me|can you|could you|explain|give me|i want to know|說說|介紹|解釋|請講講|我想知道)\b",
     re.I,
 )
+
+def _looks_specific(q: str, contexts: list[dict]) -> bool:
+    """
+    返回 True 表示“这个查询已经足够具体”，不要再触发澄清。
+    判据：
+      - 含《》书名号（通常是确指标题）
+      - 命中你定义的实体正则（政策/津贴名等）
+      - 在 topN 候选文本里出现了原样短语（严格包含）
+    """
+    qn = _norm_for_entity(q)
+    if "《" in qn and "》" in qn: return True
+    if _ENTITY_PAT.search(qn):    return True
+    inner = None
+    m = re.search(r"《(.+?)》", qn)
+    if m: inner = m.group(1).strip()
+    phrase = (inner or qn).strip()
+    if phrase:
+        for c in contexts[:10]:
+            t = (c.get("text") or (c.get("meta") or {}).get("text") or "")
+            if t and phrase in t:
+                return True
+    return False
 
 def _tokenize_simple(s: str) -> list[str]:
     return [t for t in re.findall(r"\w+|[\u4e00-\u9fff]", s or "") if t.strip()]
@@ -123,6 +219,8 @@ _GENERIC_TEMPLATES = [
 ]
 
 _GENERIC_EMB: np.ndarray | None = None  # 懒加载缓存
+
+
 
 def _ensure_generic_emb() -> np.ndarray:
     global _GENERIC_EMB
@@ -198,18 +296,22 @@ def _expand_aliases(text: str) -> str:
     return out
 
 def _guess_entity_from_history(msgs: list[dict]) -> str | None:
-    # 从后往前找最近出现的“明确名词”，优先 assistant，再到 user
+    """從對話歷史中猜測最近出現的明確政策/津貼名（支援繁中與全角）"""
     for m in reversed(msgs):
         txt = _expand_aliases((m.get("content") or "").strip())
         if not txt:
             continue
-        hit = _ENTITY_PAT.search(txt)
+        # 🔹在匹配前做正規化
+        normed = _norm_for_entity(txt)
+        hit = _ENTITY_PAT.search(normed)
         if hit:
             return hit.group(0)
-    # 如果还没有，最后退回到首问中的名词
+
+    # 若仍未命中，退回首輪訊息再試
     for m in msgs:
         txt = _expand_aliases((m.get("content") or "").strip())
-        hit = _ENTITY_PAT.search(txt)
+        normed = _norm_for_entity(txt)
+        hit = _ENTITY_PAT.search(normed)
         if hit:
             return hit.group(0)
     return None
@@ -496,10 +598,38 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
             # 不粗暴替换用户原句，只给检索信号加注释
             user_query = f"{user_query} (about {ent})"
     
-    # 3) 用改写后的独立问题进行检索
+    # 3) 用改写后的独立问题进行检索（繁中：原文 + 英译 双通道合并）
     is_followup_pronoun = bool(_PRONOUN_PAT.search(msgs[-1]["content"]))
-    contexts = hybrid_retrieve(user_query, idx, emb, settings.top_k, soft=is_followup_pronoun)
-    
+
+    if req.language == "zh-Hant":
+        # 3.1 别名/俗称扩展（只影响检索，不改动原 messages）
+        query_zh = _expand_aliases_zh(user_query)
+
+        # 3.2 同时用繁中与英译检索
+        try:
+            query_en = await smartcare_translate_to_en(query_zh)
+        except Exception:
+            query_en = None
+
+        hits_zh = hybrid_retrieve(query_zh, idx, emb, settings.top_k, soft=is_followup_pronoun)
+        hits_en = hybrid_retrieve(query_en, idx, emb, settings.top_k, soft=True) if query_en else []
+
+        # 3.3 合并去重（保留较高分，截到 top_k）
+        contexts = _merge_dedup_hits(hits_zh, hits_en, settings.top_k)
+
+        # （可选）把“实际用于检索的 query”记下来便于日志排查
+        user_query = query_zh
+    else:
+        contexts = hybrid_retrieve(user_query, idx, emb, settings.top_k, soft=is_followup_pronoun)
+
+    # 从“当前问句”和“上一个问句/回答”中抓一个焦点短语
+    focus = (_extract_focus_phrase(msgs[-1]["content"]) or
+            (len(msgs) >= 2 and _extract_focus_phrase(msgs[-2]["content"])) or
+            _guess_entity_from_history(msgs))
+
+    # 按焦点短语重排（把包含该短语的分片往前推）
+    contexts = _boost_by_phrase(contexts, focus, boost=0.35)
+
     # === 先判斷是否找得到來源 ===
     if len(contexts) < settings.min_sources_required:
         text = _not_found_text(req.language)
@@ -510,20 +640,9 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
             return StreamingResponse(event_stream(), media_type="text/plain")
         else:
             return ChatAnswer(answer=text, citations=[])
-
-    # # 若命中不足，且疑似 CJK 查詢 → 翻譯成英文後重試一次
-    # if len(contexts) < settings.min_sources_required and _looks_cjk(user_query):
-    #     try:
-    #         q_en = await smartcare_translate_to_en(user_query)
-    #         contexts2 = hybrid_retrieve(q_en, idx, emb, settings.top_k, soft=True)
-    #         if len(contexts2) >= len(contexts):
-    #             user_query = q_en  # 記錄實際用來檢索的查詢
-    #             contexts = contexts2
-    #     except Exception:
-    #         pass
     
     # === 再檢查是否過於籠統（但已有來源） ===
-    if _should_clarify_smart(user_query):
+    if _should_clarify_smart(user_query) and not _looks_specific(user_query, contexts):
         text = _clarify_question_smart(user_query, req.language, idx, emb)
         if req.stream:
             async def event_stream():
@@ -533,18 +652,24 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
         else:
             return ChatAnswer(answer=text, citations=[])
 
-
     # 4) 正常拼 prompt（把原 messages 发给模型，这样它能“按上下文口吻”回答）
     prompt_msgs = build_prompt(msgs, contexts)
     if req.language == "zh-Hant":
         prompt_msgs.insert(0, {
             "role": "system",
-            "content": "請使用繁體中文回答所有問題。"
+            "content": (
+                "請使用繁體中文回答所有問題，"
+                "語氣親切、句子簡短，避免使用艱深詞彙，"
+                "讓長者能容易明白。"
+            )
         })
     elif req.language == "en":
         prompt_msgs.insert(0, {
             "role": "system",
-            "content": "Please answer in English."
+            "content": (
+                "Please answer in clear, short English sentences suitable for older adults. "
+                "Avoid jargon and keep the response friendly."
+            )
         })
 
     if req.stream:
@@ -605,3 +730,4 @@ async def chat(req: ChatRequest, _auth=Depends(require_bearer)):
 
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host=settings.host, port=settings.port, reload=True)
+    
