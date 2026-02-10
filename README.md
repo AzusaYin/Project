@@ -61,16 +61,6 @@ curl -X POST http://localhost:8001/chat \
   }' -w '\n'
 ```
 
-curl -X POST http://localhost:8001/chat \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer K3SYw0UNdctORRP2gpSaPcRMLgrXgL_q7tS7MT5PirQ" \
-  -d '{
-    "messages": [
-      {"role": "user", "content": "What about Eligibility for Operating Subvented Welfare?"}
-    ],
-    "stream": false
-  }' -w '\n'
-
 ### Stream (raw lines)
 ```bash
 curl -N -X POST http://localhost:8001/chat \
@@ -82,22 +72,6 @@ curl -N -X POST http://localhost:8001/chat \
     "stream": true
   }' -w '\n'
 ```
-
-hexdump -C -n 64 data/index/meta.json
-hexdump -C -n 64 data/index/bm25.json
-hexdump -C -n 32 data/index/faiss.index
-
-python - <<'PY'
-from app.security import decrypt_bytes
-p = "data/index/meta.json"
-print(decrypt_bytes(open(p,"rb").read())[:200])
-PY
-
-python - <<'PY'
-from app.security import decrypt_bytes
-p = "data/index/bm25.json"
-print(decrypt_bytes(open(p,"rb").read())[:200])
-PY
 
 ## Notes
 - You should better run ```scripts/tune_thresholds.py``` once per day to improve the performance of chat robot.
