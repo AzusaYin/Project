@@ -215,10 +215,10 @@ ENCRYPTION_KEY_B64=<base64_encoded_32_byte_key>
 ALLOWED_ORIGINS=["http://localhost:5173"]
 
 # RAG
-CHUNK_SIZE=1800
-CHUNK_OVERLAP=250
-TOP_K=8
-EMBEDDING_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
+CHUNK_SIZE=1500
+CHUNK_OVERLAP=200
+TOP_K=5
+EMBEDDING_MODEL_NAME=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 EMBEDDING_DEVICE=cpu  # or "cuda" for GPU
 
 # SmartCare LLM
@@ -236,10 +236,10 @@ MIN_SOURCES_REQUIRED=1
 
 **To generate encryption key**:
 ```python
-from cryptography.fernet import Fernet
 import base64
-key = Fernet.generate_key()
-print(base64.b64encode(key).decode())
+import secrets
+key = secrets.token_bytes(32)
+print(base64.urlsafe_b64encode(key).decode())
 ```
 
 ### Frontend (.env in frontend/)
@@ -465,7 +465,7 @@ print(secrets.token_urlsafe(32))
 
 ### Data Encryption
 
-- All index files encrypted with AES-GCM (Fernet)
+- Index payloads are encrypted with AES-GCM using a fresh 12-byte nonce per payload
 - Key stored in `ENCRYPTION_KEY_B64` (must be base64-encoded 32-byte key)
 - Disable encryption: Set `ENCRYPT_DATA=false` (NOT recommended)
 
@@ -634,7 +634,7 @@ print(secrets.token_urlsafe(32))
 
 ### Branch Strategy
 
-- `main`: Stable production branch
+- `master`: Stable production branch
 - `claude/claude-md-*`: AI assistant working branches (auto-generated)
 - Feature branches: `feature/<name>` (if working on major features)
 
